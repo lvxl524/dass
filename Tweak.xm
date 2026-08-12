@@ -1,28 +1,29 @@
-// dass v1.6 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层（全变体信号 + 弹窗取证版）
+// dass v1.7 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层（无条件防御版）
 //
-// v1.5 实机反馈：仍"验证弹窗一出即注销"。v1.5 只 hook 了 LAContext 的
-// evaluatePolicy:localizedReason:reply: 与 evaluatePolicy:options:reply: 两个变体，
-// 且无任何"弹窗在哪里/长什么样"的记录 —— 若 BioProtect 走 evaluateAccessControl:
-// 或私有生物识别通道，信号即全部落空且无从定位。
+// v1.5/v1.6 实机反馈：仍"验证弹窗一出即注销"。diag5 实锤：
+//   · trace 无任何 [LA]/[ALERT]/BLOCK 记录 → LAContext/UIAlertController 信号
+//     从未命中（BioProtect 4.7 走自定义弹窗 + 私有生物识别通道，不走公开 API）
+//   · v1.4→v1.6 ctor 记录从无 WeChat → dass 全进程 filter 正常，但 BioProtect
+//     验证弹窗出现在 SpringBoard（21:27 SpringBoard SIGABRT 触发安全模式）
 //
-// v1.6 变更：
-//   1. LAContext 信号扩展为三个变体：
-//      · evaluatePolicy:localizedReason:reply:
-//      · evaluatePolicy:options:reply:
-//      · evaluateAccessControl:operation:options:reply:  （Secure Enclave 访问控制通道）
-//      （方法不存在时 %hook 静默 no-op，零副作用）
-//   2. 新增 UIAlertController viewDidAppear 全进程弹窗取证：
-//      记录 进程名 | 弹窗类名 | title | message | presenting 链 —— 直接锁定
-//      BioProtect 弹窗的进程与类名（此前所有"猜类名"均失败，因为不知道真名）；
-//      若弹窗类名/呈现链含 BioProtect 特征，同时触发 BLOCK。
-//   3. 保留 v1.5 全部逻辑：Global.Enabled 釜底抽薪 + Reload 通知 + 嵌套计数 +
-//      120s 超时兜底 + 禁用后一次性异步消毒 + BioProtect 类名辅助信号。
+// 决定性源码证据（本轮）：
+//   · Alerts.x 是 0.1.0b 新增组件（0.0.9a 的 Hooks 目录没有 Alerts.x）——
+//     与"0.0.9a 正常、0.1.0b 出问题"完全吻合，弹窗破坏源锁定 Alerts；
+//   · LGAlertsEnabled() = lgHostEnabled(@"Alerts")，读独立偏好 Alerts.Enabled
+//     （默认 YES）；lgHostEnabled 实现确认：Global.Enabled=YES 时各 host 由
+//     <prefix>.Enabled 独立控制；
+//   · Alerts.x 的 %ctor 只在 SpringBoard/Preferences 进程 init。
 //
-// 机制（沿用 v1.5，源码确认）：
-//   · lgHostEnabled(prefix) 第一道门 = 偏好 dylv.liquidassprefs 域 Global.Enabled，
-//     Global.Enabled=NO 时 LiquidAss 全部组件动作停止；
-//   · LGSharedSupport 与 LGGlassKit 都监听 Darwin 通知 "dylv.liquidassprefs/Reload"
-//     刷新缓存 —— 写偏好 + post 通知，全进程同时生效。
+// v1.7 方案（不再依赖信号，无条件防御）：
+//   1. dass 在 SpringBoard/Preferences 进程加载后 2s，把 Alerts.Enabled 写 NO
+//      + post Reload 通知 → LiquidAss Alerts 组件全部动作停止（弹窗不再被
+//      隐藏背板/注入玻璃/递归改造）→ BioProtect 验证弹窗正常显示；
+//   2. 只关 Alerts.Enabled，不动 Global.Enabled → LiquidAss 其他美化组件
+//      （TabBar/键盘/Spotlight 等）完全不受影响；
+//   3. 保留 v1.6 全部信号与取证（LAContext 三变体 / UIAlertController /
+//      UIView / UIViewController / UIAlertView）：若验证真走 LAContext，
+//      命中时再全关 Global.Enabled 双保险；Alerts.Enabled 保持 NO 不回滚；
+//   4. 保留嵌套计数 + 120s 超时 + 一次性异步消毒。
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -41,6 +42,7 @@
 #define LGPREFS_DOMAIN      CFSTR("dylv.liquidassprefs")
 #define LGPREFS_RELOAD      CFSTR("dylv.liquidassprefs/Reload")
 #define KEY_GLOBAL_ENABLED  CFSTR("Global.Enabled")
+#define KEY_ALERTS_ENABLED  CFSTR("Alerts.Enabled")
 
 #pragma mark - 全局状态（gLock 保护）
 
@@ -107,6 +109,21 @@ static void lgPostReloadLocked(void) {
                                          LGPREFS_RELOAD, NULL, NULL, TRUE);
 }
 
+// v1.7 核心：无条件把 Alerts.Enabled 置 NO（破坏源组件停摆）。
+// 与 Global 不同：Alerts.Enabled absent 时 lgHostEnabled 返回 YES（默认开），
+// 因此必须显式写 NO；只关 Alerts，不动 Global.Enabled → 其他美化保留。
+static void lgAlertsDisable(void) {
+    pthread_mutex_lock(&gLock);
+    CFPreferencesAppSynchronize(LGPREFS_DOMAIN);
+    CFPreferencesSetValue(KEY_ALERTS_ENABLED, kCFBooleanFalse,
+                          LGPREFS_DOMAIN, kCFPreferencesCurrentUser,
+                          kCFPreferencesAnyHost);
+    CFPreferencesAppSynchronize(LGPREFS_DOMAIN);
+    lgPostReloadLocked();
+    lgTraceLocked("alerts: Alerts.Enabled -> NO, Reload posted (unconditional guard)\n");
+    pthread_mutex_unlock(&gLock);
+}
+
 // 把 Global.Enabled 置 NO。仅当原值为 YES 时才真正写（否则跳过，
 // 避免覆盖"用户本来就关着"的状态），并记录本次是否切换。
 static void lgPrefsDisableLocked(void) {
@@ -132,7 +149,7 @@ static void lgPrefsDisableLocked(void) {
     lgTraceLocked("prefs: Global.Enabled YES -> NO, Reload posted\n");
 }
 
-// 恢复 Global.Enabled=YES。
+// 恢复 Global.Enabled=YES（Alerts.Enabled 保持 NO 不回滚）。
 static void lgPrefsRestoreLocked(void) {
     if (!gLGPrefsToggled) return;
     CFPreferencesSetValue(KEY_GLOBAL_ENABLED, kCFBooleanTrue,
@@ -414,8 +431,21 @@ static void lgSetBlocked(BOOL blocked, const char *why) {
 #pragma mark - 初始化
 
 %ctor {
-    lgTrace("ctor: dass v1.6 loaded\n");
+    lgTrace("ctor: dass v1.7 loaded\n");
     // 无条件初始化：LAContext/UIView/UIViewController/UIAlertView/UIAlertController
     // 在所有 UIKit 进程存在，类名检测在非 BioProtect 环境自然 no-op，零副作用。
     %init(LGBlockSignals);
+
+    // v1.7 无条件防御：Alerts.x 只在 SpringBoard/Preferences 进程生效
+    // （%ctor 进程门控），且是 0.1.0b 新增的弹窗破坏源。dass 在这两个进程
+    // 加载后 2s 把 Alerts.Enabled 写 NO + Reload → Alerts 组件停摆，
+    // BioProtect 验证弹窗不再被隐藏背板/注入玻璃/递归改造。
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    if ([bid isEqualToString:@"com.apple.springboard"] ||
+        [bid isEqualToString:@"com.apple.Preferences"]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            lgAlertsDisable();
+        });
+    }
 }
