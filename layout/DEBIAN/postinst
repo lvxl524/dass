@@ -1,0 +1,7 @@
+#!/bin/sh
+# postinst for dass
+set -e
+
+killall -9 SpringBoard || true
+
+exit 0
