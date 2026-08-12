@@ -48,6 +48,7 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <LocalAuthentication/LocalAuthentication.h>
 #import <objc/runtime.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <stdio.h>
@@ -284,9 +285,7 @@ static void lgSetBlocked(BOOL blocked, const char *why) {
     pthread_mutex_unlock(&gLock);
 }
 
-#pragma mark - LAContext 接口声明（NSInteger 代替 LAPolicy，避免链接 LocalAuthentication）
-
-@class LAContext;
+#pragma mark - LAContext 接口声明（NSInteger 代替 LAPolicy，避免链接 LocalAuthentication 符号）
 
 @interface LAContext (LGCompat)
 - (void)evaluatePolicy:(NSInteger)policy localizedReason:(NSString *)localizedReason reply:(void (^)(BOOL success, NSError *error))reply;
