@@ -176,6 +176,8 @@ static void lgSetBlocked(BOOL blocked) {
 
 #pragma mark - 拦截 hooks（所有 UIKit 进程，gLGBlocked 为 NO 时纯透传）
 
+%group LGBlockIntercept
+
 %hook MTMaterialView
 
 - (void)setHidden:(BOOL)hidden {
@@ -245,6 +247,8 @@ static void lgSetBlocked(BOOL blocked) {
 
 %end
 
+%end // LGBlockIntercept
+
 #pragma mark - 初始化
 
 %ctor {
@@ -252,5 +256,5 @@ static void lgSetBlocked(BOOL blocked) {
     // hook 内类名检测在非 BioProtect 环境自然 no-op，零副作用；
     // 不依赖 BioProtect dylib 加载顺序（若 dass 先加载，类名检测照样命中）。
     %init(LGBlockSignals);
-    // 拦截 hooks 无条件生效（gLGBlocked=NO 时纯透传）
+    %init(LGBlockIntercept);
 }
