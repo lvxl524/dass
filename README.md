@@ -4,28 +4,30 @@
 
 ## 问题
 
-LiquidAss 0.1.0b 将注入范围从 SpringBoard/Preferences 扩大到全部 UIKit 进程，并新增了两处与 BioProtectXS 冲突的行为：
+LiquidAss 0.1.0b 新增的 Alerts hook 在 SpringBoard/Preferences 进程中把所有 `UIAlertController` 弹窗内的 `UIVisualEffectView` / `*Backdrop*` 背板隐藏（`hidden=YES, alpha=0`），并注入 `LGLiveBackdropView` 玻璃层。
 
-1. `MTMaterialView setHidden:` 在装有玻璃层时强制 `hidden=YES`；
-2. Alerts hook 在 SpringBoard/Preferences 中把 `UIAlertController` 内的 `UIVisualEffectView` / `*Backdrop*` 背板全部隐藏、alpha 置 0，并注入 `LGLiveBackdropView` 玻璃层。
+BioProtectXS 的解锁弹窗（`BioAlertView`，UIAlertView 子类，经 SBAlertItem/SBAlertManager 呈现）内部就是 UIAlertController —— 背板被隐藏后解锁弹窗的模糊背景直接消失，人脸验证界面无法正常显示。
 
-BioProtectXS 的模糊锁屏与解锁弹窗依赖 `UIVisualEffectView + UIBlurEffect` 背板，背板被隐藏后解锁界面直接无法显示。
+## 方案（v1.1）
 
-## 方案
+按"人脸验证瞬间暂停 LiquidAss、验证完成后释放"的思路：
 
-`dass` 注入到同样的 UIKit 进程（`com.apple.UIKit`），检测 BioProtect 上下文（类名含 `BioProtect` 的视图/控制器所在的窗口/祖先链）：
+1. **信号检测**（父类 hook + 类名检测，任何呈现方式都命中）：
+   - `UIView -didMoveToWindow`：`BioAlertView` / `BioProtectBlurView` 出现/消失；
+   - `UIViewController` 生命周期：`BioProtect*Controller` 出现/消失（含 App 进程的 `BioProtectedAppExtension`，覆盖 blockingView 遮挡阶段）；
+   - `UIAlertView -show/dismiss`：`BioAlert*` 兜底。
+2. **验证期间全局阻止 LiquidAss**（全局标志 `gLGBlocked`）：
+   - `setHidden:` / `setAlpha:` 拦截：LiquidAss 想隐藏背板时强制恢复（`layer.hidden` 直写，与 hook 链顺序无关）；
+   - 持续消毒（200ms timer）：剥离所有 `LGLive*` / `LiquidAss*` 玻璃层，恢复 `MTMaterialView` / `UIVisualEffectView` / `*Backdrop*` / 分隔线可见性与 alpha。
+3. **释放**：弹窗消失 → 标志复位 → LiquidAss 恢复正常（300s 超时兜底防止卡死）。
 
-- 强制 `MTMaterialView` / `UIVisualEffectView` / `*Backdrop*` 视图可见（`hidden=NO`）、`alpha=1`，通过 `layer.hidden` 直写绕过 hook 链，与 dylib 加载顺序无关；
-- 剥离 LiquidAss 注入的 `LGLiveBackdropView` 玻璃层；
-- `UIAlertController` 出现/布局时异步恢复其背板。
-
-非 BioProtect 上下文完全透传，不影响 LiquidAss 自身功能。
+非 BioProtect 环境（进程内无 BioProtect 相关类）任何信号都不触发 → 完全透传，零副作用。
 
 ## 安装
 
 ```sh
 # 需要已安装 BioProtectXS (org.mr.bioprotectxs-rootless)
-dpkg -i com.lvxl.dass_1.0.0_iphoneos-arm64.deb
+dpkg -i com.lvxl.dass_1.1.0_iphoneos-arm64.deb
 killall -9 SpringBoard
 ```
 

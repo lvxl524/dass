@@ -1,25 +1,30 @@
-// dass — BioProtectXS × LiquidAss 0.1.0b 兼容适配层
+// dass v1.1 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层
 //
-// 背景：
-//   LiquidAss 0.1.0b 把注入范围从 SpringBoard/Preferences 扩大到全部 UIKit 进程，并新增：
-//     · LGGlassKit.x 中 %hook MTMaterialView setHidden: —— 只要该 material 上装了
-//       LGLiveBackdropView 玻璃层就强制 hidden=YES；
-//     · Hooks/Alerts.x —— 在 SpringBoard/Preferences 中把 UIAlertController 内的
-//       UIVisualEffectView / *Backdrop* 视图全部隐藏并把 alpha 置 0，再插入
-//       LGLiveBackdropView 玻璃层。
-//   BioProtectXS 的解锁界面（BioProtectBlurView / BioProtectUnlockController /
-//   UIAlertController 弹窗）大量依赖 UIVisualEffectView + UIBlurEffect 的背板渲染，
-//   背板被隐藏后模糊锁屏/解锁弹窗直接“消失”，表现为插件无法工作。
+// v1.1 核心思路（用户方案）：人脸验证（BioProtect 解锁弹窗出现）的瞬间
+// 全局阻止 LiquidAss 运行，验证完成（弹窗消失）后释放，LiquidAss 恢复正常。
 //
-// 方案：
-//   dass 作为兼容层注入到同样的 UIKit 进程（com.apple.UIKit filter），
-//   检测 BioProtect 上下文（类名含 "BioProtect" 的视图/控制器所在的窗口/祖先链），
-//   在检测命中时：
-//     · 强制 MTMaterialView / UIVisualEffectView / Backdrop 视图可见（hidden=NO）、alpha=1
-//       —— 通过 layer.hidden 直写绕过 hook 链，与加载顺序无关；
-//     · 剥离 LiquidAss 注入的 LGLiveBackdropView 玻璃层；
-//     · UIAlertController 出现/布局时异步恢复其背板。
-//   非 BioProtect 上下文完全透传，不影响 LiquidAss 自身功能。
+// v1.0 失效原因：BioProtect 解锁弹窗是 UIAlertView 子类（BioAlertView），经
+// SBAlertItem/SBAlertManager 在 SpringBoard 进程呈现；UIAlertView 在 iOS 8+
+// 内部就是 UIAlertController，LiquidAss Alerts.x 的 UIAlertController hook
+// 命中后注入 LGLiveBackdropView 玻璃层并把弹窗内所有 UIVisualEffectView /
+// *Backdrop* 背板置为 hidden/alpha=0 → 解锁弹窗模糊背景消失。而内部
+// UIAlertController 的 presenting 链上没有 "BioProtect" 类（BioProtect 只做
+// delegate），v1.0 的类名上下文检测命中不了，恢复逻辑没触发。
+//
+// v1.1 信号（父类 hook + 类名检测，任何呈现方式都命中）：
+//   · UIView -didMoveToWindow   ：BioAlertView / BioProtectBlurView 出现/消失
+//   · UIViewController 生命周期 ：BioProtect*Controller 出现/消失（含 App 进程的
+//     BioProtectedAppExtension，覆盖 blockingView 遮挡阶段）
+//   · UIAlertView -show/dismiss ：BioAlert*（兜底，直接 show 的旧 API）
+// 信号触发 → 全局标志 gLGBlocked：
+//   · setHidden:/setAlpha: 拦截：阻止 LiquidAss 隐藏背板（强制恢复）
+//   · 持续消毒（200ms timer）：剥离 LGLive*/LiquidAss* 玻璃层、
+//     恢复 MTMaterialView/UIVisualEffectView/*Backdrop* 可见性与 alpha
+// 弹窗消失 → 标志复位 → LiquidAss 恢复正常。
+//
+// 非 BioProtect 环境（进程内无 BioAlertItem/BioProtectBlurView 等类）任何
+// 信号都不会触发 → 完全透传，零副作用。
+// 超时兜底：begin 后 300s 无 end 强制释放，防止标志卡死导致 LiquidAss 永久禁用。
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -29,132 +34,164 @@
 @interface MTMaterialView : UIView @end
 @interface _UIInterfaceActionVibrantSeparatorView : UIView @end
 
-#pragma mark - BioProtect 上下文检测
+#pragma mark - 全局状态
 
-static BOOL bpNameMatches(id obj) {
-    if (!obj) return NO;
-    NSString *name = NSStringFromClass([obj class]);
-    if (!name.length) return NO;
-    return [name rangeOfString:@"BioProtect"
-                       options:NSCaseInsensitiveSearch].location != NSNotFound;
-}
+static BOOL gLGBlocked = NO;          // YES = 人脸验证进行中，LiquidAss 暂停
+static dispatch_source_t gSanitizeSource; // 消毒 timer
+static CFTimeInterval gBlockedSince = 0;
 
-static BOOL bpSubtreeContainsBioProtect(UIView *root, NSUInteger *budget) {
-    if (!root) return NO;
-    if (bpNameMatches(root)) return YES;
-    if (*budget == 0) return NO;
-    (*budget)--;
-    for (UIView *sub in root.subviews) {
-        if (bpSubtreeContainsBioProtect(sub, budget)) return YES;
-        if (*budget == 0) return NO;
-    }
-    return NO;
-}
+static void lgSetBlocked(BOOL blocked);
 
-static BOOL bpWindowIsProtected(UIWindow *window) {
-    if (!window) return NO;
-    static NSMapTable<UIWindow *, NSDictionary *> *cache; // weak window -> {t,p}
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        cache = [NSMapTable weakToStrongObjectsMapTable];
-    });
-    NSTimeInterval now = CACurrentMediaTime();
-    NSDictionary *entry = [cache objectForKey:window];
-    if (entry && now - [entry[@"t"] doubleValue] < 1.0)
-        return [entry[@"p"] boolValue];
+#pragma mark - 消毒工具
 
-    NSUInteger budget = 3000;
-    BOOL isProtected = bpSubtreeContainsBioProtect(window, &budget);
-    if (!isProtected) {
-        for (UIViewController *vc = window.rootViewController; vc; vc = vc.presentedViewController) {
-            if (bpNameMatches(vc)) { isProtected = YES; break; }
-        }
-    }
-    [cache setObject:@{ @"t": @(now), @"p": @(isProtected) } forKey:window];
-    return isProtected;
-}
-
-static BOOL bpIsBioProtectContext(UIView *view) {
-    if (!view) return NO;
-    for (UIView *cur = view; cur; cur = cur.superview) {
-        if (bpNameMatches(cur)) return YES;
-    }
-    return bpWindowIsProtected(view.window);
-}
-
-static BOOL bpIsBioProtectAlert(UIAlertController *alert) {
-    if (bpNameMatches(alert)) return YES;
-    if (bpIsBioProtectContext(alert.view)) return YES;
-    for (UIViewController *vc = alert.presentingViewController; vc; vc = vc.presentingViewController) {
-        if (bpNameMatches(vc)) return YES;
-        if (vc.view && bpIsBioProtectContext(vc.view)) return YES;
-    }
-    return NO;
-}
-
-#pragma mark - 修复工具
-
-static void bpStripLiquidGlass(UIView *root) {
-    if (!root) return;
-    for (UIView *sub in [root.subviews copy]) {
+static void lgSanitizeSubtree(UIView *view) {
+    if (!view) return;
+    for (UIView *sub in [view.subviews copy]) {
         NSString *name = NSStringFromClass(sub.class);
+        // 剥离 LiquidAss 注入的玻璃层
         if ([name hasPrefix:@"LGLive"] || [name hasPrefix:@"LiquidAss"]) {
             [sub removeFromSuperview];
             continue;
         }
-        bpStripLiquidGlass(sub);
+        // 恢复被 LiquidAss 抑制的背板/材质/分隔线
+        if ([sub isKindOfClass:[UIVisualEffectView class]] ||
+            [name containsString:@"Backdrop"] ||
+            [name isEqualToString:@"MTMaterialView"] ||
+            [name isEqualToString:@"_UIInterfaceActionVibrantSeparatorView"]) {
+            sub.hidden = NO;
+            sub.layer.hidden = NO; // layer 直写，绕过任何 hook 链
+            sub.alpha = 1.0;
+        }
+        lgSanitizeSubtree(sub);
     }
 }
 
-static void bpRepairSingle(UIView *view) {
-    if (!view) return;
-    NSString *name = NSStringFromClass(view.class);
-    BOOL relevant = [view isKindOfClass:[UIVisualEffectView class]] ||
-                    [name containsString:@"Backdrop"] ||
-                    [name isEqualToString:@"MTMaterialView"];
-    if (!relevant) return;
-    view.hidden = NO;
-    view.layer.hidden = NO;
-    view.alpha = 1.0;
+static void lgSanitizeAll(void) {
+    for (UIWindow *window in UIApplication.sharedApplication.windows)
+        lgSanitizeSubtree(window);
 }
 
-static void bpRepairSubtree(UIView *root) {
-    if (!root) return;
-    bpRepairSingle(root);
-    for (UIView *sub in root.subviews) bpRepairSubtree(sub);
+#pragma mark - 消毒 timer
+
+static void lgStopSanitizeTimer(void) {
+    if (gSanitizeSource) {
+        dispatch_source_cancel(gSanitizeSource);
+        gSanitizeSource = nil;
+    }
 }
 
-static void bpDeferRestoreAlert(UIAlertController *alert) {
-    __weak UIAlertController *weakAlert = alert;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *a = weakAlert;
-        UIView *root = a.view;
-        if (!root) return;
-        bpStripLiquidGlass(root);
-        bpRepairSubtree(root);
+static void lgStartSanitizeTimer(void) {
+    if (gSanitizeSource) return;
+    dispatch_source_t source = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(source,
+        dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+        200 * NSEC_PER_MSEC, 0);
+    dispatch_source_set_event_handler(source, ^{
+        // 超时兜底：300s 无结束信号，强制释放
+        if (gBlockedSince > 0 &&
+            CACurrentMediaTime() - gBlockedSince > 300.0) {
+            lgSetBlocked(NO);
+            return;
+        }
+        if (!gLGBlocked) {
+            lgStopSanitizeTimer();
+            return;
+        }
+        lgSanitizeAll();
     });
+    dispatch_resume(source);
+    gSanitizeSource = source;
 }
 
-#pragma mark - Hooks
+static void lgSetBlocked(BOOL blocked) {
+    if (gLGBlocked == blocked) return;
+    gLGBlocked = blocked;
+    if (blocked) {
+        gBlockedSince = CACurrentMediaTime();
+        lgSanitizeAll();        // 立即消毒一次
+        lgStartSanitizeTimer(); // 持续消毒，直到释放
+    } else {
+        gBlockedSince = 0;
+        lgStopSanitizeTimer();
+        lgSanitizeAll();        // 最终消毒，确保释放后界面干净
+    }
+}
+
+#pragma mark - 信号 hooks（父类 hook + 类名检测）
+
+%group LGBlockSignals
+
+%hook UIView
+
+- (void)didMoveToWindow {
+    %orig;
+    NSString *name = NSStringFromClass(self.class);
+    if ([name containsString:@"BioProtectBlurView"] ||
+        [name containsString:@"BioAlertView"] ||
+        [name hasPrefix:@"BioAlert"]) {
+        lgSetBlocked(self.window != nil);
+    }
+}
+
+%end
+
+%hook UIViewController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    NSString *name = NSStringFromClass(self.class);
+    if ([name containsString:@"BioProtect"] ||
+        [name hasPrefix:@"BioAlert"])
+        lgSetBlocked(YES);
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    %orig;
+    NSString *name = NSStringFromClass(self.class);
+    if ([name containsString:@"BioProtect"] ||
+        [name hasPrefix:@"BioAlert"])
+        lgSetBlocked(NO);
+}
+
+%end
+
+%hook UIAlertView
+
+- (void)show {
+    NSString *name = NSStringFromClass(self.class);
+    if ([name containsString:@"Bio"]) lgSetBlocked(YES);
+    %orig;
+}
+
+- (void)dismissWithClickedButtonIndex:(NSInteger)buttonIndex animated:(BOOL)animated {
+    NSString *name = NSStringFromClass(self.class);
+    if ([name containsString:@"Bio"]) lgSetBlocked(NO);
+    %orig(buttonIndex, animated);
+}
+
+%end
+
+%end // LGBlockSignals
+
+#pragma mark - 拦截 hooks（所有 UIKit 进程，gLGBlocked 为 NO 时纯透传）
 
 %hook MTMaterialView
 
 - (void)setHidden:(BOOL)hidden {
-    BOOL bp = bpIsBioProtectContext((UIView *)self);
-    if (bp) {
+    if (gLGBlocked) {
         hidden = NO;
         self.layer.hidden = NO;
     }
     %orig(hidden);
-    if (bp) self.layer.hidden = NO; // 无论 hook 链顺序，最终强制可见
+    if (gLGBlocked) self.layer.hidden = NO; // 无论 hook 链顺序，最终强制可见
 }
 
 - (void)layoutSubviews {
     %orig;
-    if (bpIsBioProtectContext((UIView *)self)) {
+    if (gLGBlocked) {
         self.layer.hidden = NO;
-        bpStripLiquidGlass((UIView *)self);
-        bpRepairSubtree((UIView *)self);
+        lgSanitizeSubtree((UIView *)self);
     }
 }
 
@@ -163,34 +200,28 @@ static void bpDeferRestoreAlert(UIAlertController *alert) {
 %hook UIVisualEffectView
 
 - (void)setHidden:(BOOL)hidden {
-    BOOL bp = bpIsBioProtectContext((UIView *)self);
-    if (bp) {
+    if (gLGBlocked) {
         hidden = NO;
         self.layer.hidden = NO;
     }
     %orig(hidden);
-    if (bp) self.layer.hidden = NO;
+    if (gLGBlocked) self.layer.hidden = NO;
 }
 
 - (void)setAlpha:(CGFloat)alpha {
-    BOOL bp = bpIsBioProtectContext((UIView *)self);
-    %orig(bp ? 1.0 : alpha);
-    if (bp) {
-        for (UIView *sub in self.subviews)
-            if (sub.alpha < 1.0) sub.alpha = 1.0;
-    }
+    %orig(gLGBlocked ? 1.0 : alpha);
 }
 
-- (void)didMoveToWindow {
-    %orig;
-    if (self.window && bpIsBioProtectContext((UIView *)self))
-        bpRepairSubtree((UIView *)self);
+%end
+
+%hook _UIInterfaceActionVibrantSeparatorView
+
+- (void)setHidden:(BOOL)hidden {
+    %orig(gLGBlocked ? NO : hidden);
 }
 
-- (void)layoutSubviews {
-    %orig;
-    if (bpIsBioProtectContext((UIView *)self))
-        bpRepairSubtree((UIView *)self);
+- (void)setAlpha:(CGFloat)alpha {
+    %orig(gLGBlocked ? 1.0 : alpha);
 }
 
 %end
@@ -199,28 +230,27 @@ static void bpDeferRestoreAlert(UIAlertController *alert) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    if (bpIsBioProtectAlert((UIAlertController *)self))
-        bpDeferRestoreAlert((UIAlertController *)self);
+    if (gLGBlocked) {
+        // 异步消毒，确保在 LiquidAss 的 viewDidAppear 注入之后执行
+        dispatch_async(dispatch_get_main_queue(), ^{ lgSanitizeAll(); });
+    }
 }
 
 - (void)viewDidLayoutSubviews {
     %orig;
-    if (bpIsBioProtectAlert((UIAlertController *)self))
-        bpDeferRestoreAlert((UIAlertController *)self);
+    if (gLGBlocked) {
+        dispatch_async(dispatch_get_main_queue(), ^{ lgSanitizeAll(); });
+    }
 }
 
 %end
 
-%hook _UIInterfaceActionVibrantSeparatorView
+#pragma mark - 初始化
 
-- (void)setHidden:(BOOL)hidden {
-    BOOL bp = bpIsBioProtectContext((UIView *)self);
-    %orig(bp ? NO : hidden);
+%ctor {
+    // 无条件初始化：UIView/UIViewController/UIAlertView 在全部 UIKit 进程存在，
+    // hook 内类名检测在非 BioProtect 环境自然 no-op，零副作用；
+    // 不依赖 BioProtect dylib 加载顺序（若 dass 先加载，类名检测照样命中）。
+    %init(LGBlockSignals);
+    // 拦截 hooks 无条件生效（gLGBlocked=NO 时纯透传）
 }
-
-- (void)setAlpha:(CGFloat)alpha {
-    BOOL bp = bpIsBioProtectContext((UIView *)self);
-    %orig(bp ? 1.0 : alpha);
-}
-
-%end
