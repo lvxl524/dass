@@ -1,29 +1,33 @@
-// dass v1.1 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层
+// dass v1.2 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层
 //
-// v1.1 核心思路（用户方案）：人脸验证（BioProtect 解锁弹窗出现）的瞬间
+// v1.2 核心思路（用户方案）：人脸验证（BioProtect 解锁弹窗出现）的瞬间
 // 全局阻止 LiquidAss 运行，验证完成（弹窗消失）后释放，LiquidAss 恢复正常。
 //
-// v1.0 失效原因：BioProtect 解锁弹窗是 UIAlertView 子类（BioAlertView），经
-// SBAlertItem/SBAlertManager 在 SpringBoard 进程呈现；UIAlertView 在 iOS 8+
-// 内部就是 UIAlertController，LiquidAss Alerts.x 的 UIAlertController hook
-// 命中后注入 LGLiveBackdropView 玻璃层并把弹窗内所有 UIVisualEffectView /
-// *Backdrop* 背板置为 hidden/alpha=0 → 解锁弹窗模糊背景消失。而内部
-// UIAlertController 的 presenting 链上没有 "BioProtect" 类（BioProtect 只做
-// delegate），v1.0 的类名上下文检测命中不了，恢复逻辑没触发。
+// v1.1 安全模式崩溃根因（已定位）：
+//   · MTMaterialView layoutSubviews 内递归遍历+修改视图属性 → 触发子视图
+//     重新布局 → 再次进入本 hook → 无限递归栈溢出；UIKit 另抛
+//     "Layout still needs update after calling -[super layoutSubviews]"
+//   · didMoveToWindow / viewDidAppear 回调栈内同步 lgSanitizeAll 全树消毒：
+//     视图树正在变化时遍历并修改属性
+//   · lgSanitizeSubtree 内 removeFromSuperview：遍历中增删视图层级，
+//     破坏视图树/约束/观察者 → UIKit 断言崩溃
+//   → BioProtect 弹窗一出现即 SpringBoard 崩溃 → 安全模式。
 //
-// v1.1 信号（父类 hook + 类名检测，任何呈现方式都命中）：
-//   · UIView -didMoveToWindow   ：BioAlertView / BioProtectBlurView 出现/消失
-//   · UIViewController 生命周期 ：BioProtect*Controller 出现/消失（含 App 进程的
-//     BioProtectedAppExtension，覆盖 blockingView 遮挡阶段）
-//   · UIAlertView -show/dismiss ：BioAlert*（兜底，直接 show 的旧 API）
-// 信号触发 → 全局标志 gLGBlocked：
-//   · setHidden:/setAlpha: 拦截：阻止 LiquidAss 隐藏背板（强制恢复）
-//   · 持续消毒（200ms timer）：剥离 LGLive*/LiquidAss* 玻璃层、
-//     恢复 MTMaterialView/UIVisualEffectView/*Backdrop* 可见性与 alpha
-// 弹窗消失 → 标志复位 → LiquidAss 恢复正常。
+// v1.2 修复原则：
+//   1. 信号 hook 只设置全局标志（lgSetBlocked），不做任何视图操作
+//   2. 一切视图消毒 dispatch_async 到主队列下一 runloop 执行（视图树稳定后）
+//   3. 彻底移除所有 layoutSubviews / viewDidLayoutSubviews hook
+//      （布局回调内零副作用）
+//   4. 消毒只改属性（hidden/alpha/layer.hidden），绝不 add/remove 视图层级
+//   5. 高频检测路径用 C 函数（class_getName/strstr）替代 NSString，降低开销
 //
-// 非 BioProtect 环境（进程内无 BioAlertItem/BioProtectBlurView 等类）任何
-// 信号都不会触发 → 完全透传，零副作用。
+// 时序（弹窗出现）：
+//   t0 BioAlertView show / BioProtectBlurView didMoveToWindow → 标志=YES，起 timer
+//   t1 内部 UIAlertController viewDidAppear（LiquidAss 注入玻璃层+隐藏背板）
+//   t2 下一 runloop 异步消毒（隐藏 LGLive*/LiquidAss* 玻璃、恢复背板）→ 弹窗正常
+//   t3 验证完成 dismiss → 标志=NO，停 timer，异步最终消毒 → LiquidAss 恢复
+//
+// 非 BioProtect 环境任何信号都不触发 → 完全透传，零副作用。
 // 超时兜底：begin 后 300s 无 end 强制释放，防止标志卡死导致 LiquidAss 永久禁用。
 
 #import <UIKit/UIKit.h>
@@ -42,24 +46,45 @@ static CFTimeInterval gBlockedSince = 0;
 
 static void lgSetBlocked(BOOL blocked);
 
-#pragma mark - 消毒工具
+#pragma mark - 快速类名检测（C 函数，避免高频路径的 NSString 分配）
+
+static inline BOOL lgNameHas(const char *n, const char *sub) {
+    return n && *n && sub && strstr(n, sub) != NULL;
+}
+
+// BioProtect 解锁弹窗相关视图类
+static inline BOOL lgIsBioView(UIView *v) {
+    const char *n = class_getName(object_getClass(v));
+    return lgNameHas(n, "BioProtectBlurView") ||
+           lgNameHas(n, "BioAlertView") ||
+           strncmp(n, "BioAlert", 8) == 0;
+}
+
+// BioProtect 控制器类（含 App 进程的 BioProtectedAppExtension）
+static inline BOOL lgIsBioVC(UIViewController *vc) {
+    const char *n = class_getName(object_getClass(vc));
+    return lgNameHas(n, "BioProtect") || strncmp(n, "BioAlert", 8) == 0;
+}
+
+#pragma mark - 消毒工具（只改属性，绝不增删视图层级）
 
 static void lgSanitizeSubtree(UIView *view) {
     if (!view) return;
     for (UIView *sub in [view.subviews copy]) {
-        NSString *name = NSStringFromClass(sub.class);
-        // 剥离 LiquidAss 注入的玻璃层
-        if ([name hasPrefix:@"LGLive"] || [name hasPrefix:@"LiquidAss"]) {
-            [sub removeFromSuperview];
+        const char *n = class_getName(object_getClass(sub));
+        // 玻璃层：隐藏而非移除（移除会破坏视图树，触发布局递归）
+        if (lgNameHas(n, "LGLive") || lgNameHas(n, "LiquidAss")) {
+            sub.hidden = YES;
+            sub.layer.hidden = YES; // layer 直写，绕过任何 hook 链
             continue;
         }
         // 恢复被 LiquidAss 抑制的背板/材质/分隔线
         if ([sub isKindOfClass:[UIVisualEffectView class]] ||
-            [name containsString:@"Backdrop"] ||
-            [name isEqualToString:@"MTMaterialView"] ||
-            [name isEqualToString:@"_UIInterfaceActionVibrantSeparatorView"]) {
+            lgNameHas(n, "Backdrop") ||
+            strcmp(n, "MTMaterialView") == 0 ||
+            strcmp(n, "_UIInterfaceActionVibrantSeparatorView") == 0) {
             sub.hidden = NO;
-            sub.layer.hidden = NO; // layer 直写，绕过任何 hook 链
+            sub.layer.hidden = NO;
             sub.alpha = 1.0;
         }
         lgSanitizeSubtree(sub);
@@ -69,6 +94,13 @@ static void lgSanitizeSubtree(UIView *view) {
 static void lgSanitizeAll(void) {
     for (UIWindow *window in UIApplication.sharedApplication.windows)
         lgSanitizeSubtree(window);
+}
+
+// 异步消毒：推迟到主队列下一 runloop，确保不在 UIKit 回调栈内修改视图
+static void lgSanitizeAllAsync(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        lgSanitizeAll();
+    });
 }
 
 #pragma mark - 消毒 timer
@@ -98,27 +130,29 @@ static void lgStartSanitizeTimer(void) {
             lgStopSanitizeTimer();
             return;
         }
-        lgSanitizeAll();
+        lgSanitizeAllAsync();
     });
     dispatch_resume(source);
     gSanitizeSource = source;
 }
 
+// 只设置标志 + 管理 timer；不在这里做任何视图操作
 static void lgSetBlocked(BOOL blocked) {
     if (gLGBlocked == blocked) return;
     gLGBlocked = blocked;
     if (blocked) {
+        NSLog(@"[dass v1.2] BioProtect 验证开始，暂停 LiquidAss");
         gBlockedSince = CACurrentMediaTime();
-        lgSanitizeAll();        // 立即消毒一次
-        lgStartSanitizeTimer(); // 持续消毒，直到释放
+        lgStartSanitizeTimer();
     } else {
+        NSLog(@"[dass v1.2] 验证结束，释放 LiquidAss");
         gBlockedSince = 0;
         lgStopSanitizeTimer();
-        lgSanitizeAll();        // 最终消毒，确保释放后界面干净
+        lgSanitizeAllAsync(); // 最终消毒，确保释放后界面干净
     }
 }
 
-#pragma mark - 信号 hooks（父类 hook + 类名检测）
+#pragma mark - 信号 hooks（父类 hook + 类名检测，只设标志）
 
 %group LGBlockSignals
 
@@ -126,12 +160,8 @@ static void lgSetBlocked(BOOL blocked) {
 
 - (void)didMoveToWindow {
     %orig;
-    NSString *name = NSStringFromClass(self.class);
-    if ([name containsString:@"BioProtectBlurView"] ||
-        [name containsString:@"BioAlertView"] ||
-        [name hasPrefix:@"BioAlert"]) {
+    if (lgIsBioView(self))
         lgSetBlocked(self.window != nil);
-    }
 }
 
 %end
@@ -140,17 +170,13 @@ static void lgSetBlocked(BOOL blocked) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    NSString *name = NSStringFromClass(self.class);
-    if ([name containsString:@"BioProtect"] ||
-        [name hasPrefix:@"BioAlert"])
+    if (lgIsBioVC(self))
         lgSetBlocked(YES);
 }
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
-    NSString *name = NSStringFromClass(self.class);
-    if ([name containsString:@"BioProtect"] ||
-        [name hasPrefix:@"BioAlert"])
+    if (lgIsBioVC(self))
         lgSetBlocked(NO);
 }
 
@@ -159,14 +185,12 @@ static void lgSetBlocked(BOOL blocked) {
 %hook UIAlertView
 
 - (void)show {
-    NSString *name = NSStringFromClass(self.class);
-    if ([name containsString:@"Bio"]) lgSetBlocked(YES);
+    if (lgIsBioView((UIView *)self)) lgSetBlocked(YES);
     %orig;
 }
 
 - (void)dismissWithClickedButtonIndex:(NSInteger)buttonIndex animated:(BOOL)animated {
-    NSString *name = NSStringFromClass(self.class);
-    if ([name containsString:@"Bio"]) lgSetBlocked(NO);
+    if (lgIsBioView((UIView *)self)) lgSetBlocked(NO);
     %orig(buttonIndex, animated);
 }
 
@@ -174,7 +198,7 @@ static void lgSetBlocked(BOOL blocked) {
 
 %end // LGBlockSignals
 
-#pragma mark - 拦截 hooks（所有 UIKit 进程，gLGBlocked 为 NO 时纯透传）
+#pragma mark - 拦截 hooks（属性级拦截，gLGBlocked 为 NO 时纯透传）
 
 %group LGBlockIntercept
 
@@ -187,14 +211,6 @@ static void lgSetBlocked(BOOL blocked) {
     }
     %orig(hidden);
     if (gLGBlocked) self.layer.hidden = NO; // 无论 hook 链顺序，最终强制可见
-}
-
-- (void)layoutSubviews {
-    %orig;
-    if (gLGBlocked) {
-        self.layer.hidden = NO;
-        lgSanitizeSubtree((UIView *)self);
-    }
 }
 
 %end
@@ -233,15 +249,8 @@ static void lgSetBlocked(BOOL blocked) {
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if (gLGBlocked) {
-        // 异步消毒，确保在 LiquidAss 的 viewDidAppear 注入之后执行
-        dispatch_async(dispatch_get_main_queue(), ^{ lgSanitizeAll(); });
-    }
-}
-
-- (void)viewDidLayoutSubviews {
-    %orig;
-    if (gLGBlocked) {
-        dispatch_async(dispatch_get_main_queue(), ^{ lgSanitizeAll(); });
+        // 异步消毒：确保在 LiquidAss 的 viewDidAppear 注入之后执行
+        lgSanitizeAllAsync();
     }
 }
 

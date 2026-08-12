@@ -1,9 +1,9 @@
 Package: com.lvxl.dass
 Name: dass
 Depends: mobilesubstrate, firmware (>= 15.0), org.mr.bioprotectxs-rootless
-Version: 1.1.0
+Version: 1.2.0
 Architecture: iphoneos-arm64
-Description: BioProtectXS x LiquidAss 兼容适配层 v1.1。人脸验证（BioProtect 解锁弹窗）出现瞬间全局暂停 LiquidAss 的玻璃注入与背板抑制，验证完成后自动恢复。安装后无需任何设置。
+Description: BioProtectXS x LiquidAss 兼容适配层 v1.2。人脸验证（BioProtect 解锁弹窗）出现瞬间全局暂停 LiquidAss 的玻璃注入与背板抑制，验证完成后自动恢复。v1.2 修复 v1.1 安全模式崩溃：信号只设标志、消毒全部异步、不再在布局回调内修改视图。安装后无需任何设置。
 Maintainer: lvxl
 Author: lvxl
 Section: Tweaks
