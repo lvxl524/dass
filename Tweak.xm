@@ -38,10 +38,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
-// 私有类接口声明（运行时按名字查找，SDK 无头文件）
-@interface MTMaterialView : UIView @end
-@interface _UIInterfaceActionVibrantSeparatorView : UIView @end
-
 #pragma mark - 全局状态
 
 static BOOL gLGBlocked = NO;          // YES = 人脸验证进行中，LiquidAss 暂停
@@ -78,17 +74,22 @@ static void lgSanitizeSubtree(UIView *view) {
         // 玻璃层：隐藏而非移除（移除会破坏视图树，触发布局递归）
         if (lgNameHas(n, "LGLive") || lgNameHas(n, "LiquidAss")) {
             sub.hidden = YES;
-            sub.layer.hidden = YES; // layer 直写，绕过 LiquidAss 的 setHidden hook
+            sub.layer.hidden = YES; // layer 直写，绕过任何 setHidden hook 链
             continue;
         }
-        // 恢复被 LiquidAss 抑制的背板/材质/分隔线
-        if ([sub isKindOfClass:[UIVisualEffectView class]] ||
-            lgNameHas(n, "Backdrop") ||
-            strcmp(n, "MTMaterialView") == 0 ||
+        // 私有材质类（MTMaterialView 等）：只 layer 直写恢复。
+        // 不走 setHidden: 消息——其 setHidden 可能被 LiquidAss hook 反向压制。
+        if (strcmp(n, "MTMaterialView") == 0 ||
             strcmp(n, "_UIInterfaceActionVibrantSeparatorView") == 0) {
-            sub.layer.hidden = NO; // MTMaterialView 用 layer 直写（其 setHidden 被 LiquidAss hook）
-            if (![sub isKindOfClass:[MTMaterialView class]])
-                sub.hidden = NO;
+            sub.layer.hidden = NO;
+            sub.alpha = 1.0;
+            continue;
+        }
+        // 背板/系统模糊层：完整恢复可见性与 alpha
+        if ([sub isKindOfClass:[UIVisualEffectView class]] ||
+            lgNameHas(n, "Backdrop")) {
+            sub.hidden = NO;
+            sub.layer.hidden = NO;
             sub.alpha = 1.0;
         }
         lgSanitizeSubtree(sub);
