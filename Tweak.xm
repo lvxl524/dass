@@ -1,54 +1,33 @@
-// dass v1.5 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层（偏好釜底抽薪版）
+// dass v1.6 — BioProtectXS × LiquidAss 0.1.0b 兼容适配层（全变体信号 + 弹窗取证版）
 //
-// 本轮结论（LiquidAss 0.1.0b 源码精读 + v4 实机报告双重证据）：
-//   1. BioProtect 解锁弹窗出现在【受保护 App 进程内】（崩溃证据全在 WeChat：
-//      19:20 WeChat-...-192045.ips = scene-create watchdog 0x8BADF00D，
-//      主线程 10s CPU 配额耗尽，栈 = cache_t::shouldFlush ← flushCaches ←
-//      method_setImplementation 的运行时 swizzle 风暴），而 LiquidAss 的
-//      Alerts.x 只跑 SpringBoard/Preferences —— v1.3/v1.4 的"消毒对抗 Alerts"
-//      思路方向错了：v4 trace 证明信号从未命中（无任何 BLOCK START），
-//      消毒机制全程空转。
-//   2. 0.1.0b 新增的 TabBar.x / Keyboard.x / Spotlight.x / ContextMenu.x 等
-//      【全进程组件】会在 BioProtect 锁屏 UI 上持续做样式改造（layoutSubviews
-//      递归、keyplane 运行时 class_addMethod/method_setImplementation 等），
-//      这是 WeChat 启动阶段 CPU 风暴的来源。
-//   3. 釜底抽薪点（已从源码确认）：
-//      · lgHostEnabled(prefix) 的第一道门就是
-//        LGGlassPreferenceValue(@"Global.Enabled") —— Global.Enabled=NO 时
-//        LiquidAss 全部组件（TabBar/Keyboard/Alerts/Clock/CoverSheet/...）
-//        的动作全部停止；
-//      · Alerts 的 LGAlertsEnabled() = LG_globalEnabled() && ...，
-//        LG_globalEnabled() = LG_prefBool(@"Global.Enabled", NO)，同样受门控；
-//      · 偏好域 dylv.liquidassprefs（CFPreferences app-domain），
-//        LGSharedSupport 与 LGGlassKit 都监听 Darwin 通知
-//        "dylv.liquidassprefs/Reload" 刷新各自缓存 —— 写一次偏好 + post 一次
-//        通知，全进程同时生效。
+// v1.5 实机反馈：仍"验证弹窗一出即注销"。v1.5 只 hook 了 LAContext 的
+// evaluatePolicy:localizedReason:reply: 与 evaluatePolicy:options:reply: 两个变体，
+// 且无任何"弹窗在哪里/长什么样"的记录 —— 若 BioProtect 走 evaluateAccessControl:
+// 或私有生物识别通道，信号即全部落空且无从定位。
 //
-// v1.5 机制：
-//   信号（系统级可靠信号，不再依赖猜 BioProtect 类名）：
-//     · %hook LAContext -evaluatePolicy:localizedReason:reply: 与
-//       -evaluatePolicy:options:reply: —— 人脸/指纹验证的系统入口，
-//       任何进程、任何 App 触发验证都会命中：
-//         evaluatePolicy 进入     → BLOCK（写 Global.Enabled=NO + post Reload）
-//         reply 回调执行          → RELEASE（恢复 Global.Enabled=YES + post Reload）
-//         （成功/失败/用户取消都会回调 reply，天然覆盖整个验证窗口）
-//     · 保留 BioProtect 类名辅助信号（UIView didMoveToWindow / UIViewController
-//       viewDidAppear/viewDidDisappear / UIAlertView show/dismiss）作为第二层保障
-//     · 120s 超时强制释放兜底（极端情况下 reply 未回调时）
-//   动作：
-//     · BLOCK：CFPreferencesSetValue 把 dylv.liquidassprefs 域 Global.Enabled
-//       置 NO（仅当原值为 YES 时才真正写，避免污染用户设置），
-//       CFPreferencesAppSynchronize 落盘，post Darwin Reload 通知 →
-//       LiquidAss 全进程停摆；随后一次性异步消毒（隐藏已注入的 LGLive/
-//       LiquidAss 玻璃视图、恢复被压制的背板 —— 此时 LiquidAss 不会重新注入，
-//       消毒安全且干净）
-//     · RELEASE：恢复 Global.Enabled=YES + post Reload → LiquidAss 恢复正常
-//     · 嵌套验证计数（count++/--，归零才恢复）；多进程各自把 YES→NO→YES，
-//       无中间值污染竞态
+// v1.6 变更：
+//   1. LAContext 信号扩展为三个变体：
+//      · evaluatePolicy:localizedReason:reply:
+//      · evaluatePolicy:options:reply:
+//      · evaluateAccessControl:operation:options:reply:  （Secure Enclave 访问控制通道）
+//      （方法不存在时 %hook 静默 no-op，零副作用）
+//   2. 新增 UIAlertController viewDidAppear 全进程弹窗取证：
+//      记录 进程名 | 弹窗类名 | title | message | presenting 链 —— 直接锁定
+//      BioProtect 弹窗的进程与类名（此前所有"猜类名"均失败，因为不知道真名）；
+//      若弹窗类名/呈现链含 BioProtect 特征，同时触发 BLOCK。
+//   3. 保留 v1.5 全部逻辑：Global.Enabled 釜底抽薪 + Reload 通知 + 嵌套计数 +
+//      120s 超时兜底 + 禁用后一次性异步消毒 + BioProtect 类名辅助信号。
+//
+// 机制（沿用 v1.5，源码确认）：
+//   · lgHostEnabled(prefix) 第一道门 = 偏好 dylv.liquidassprefs 域 Global.Enabled，
+//     Global.Enabled=NO 时 LiquidAss 全部组件动作停止；
+//   · LGSharedSupport 与 LGGlassKit 都监听 Darwin 通知 "dylv.liquidassprefs/Reload"
+//     刷新缓存 —— 写偏好 + post 通知，全进程同时生效。
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <LocalAuthentication/LocalAuthentication.h>
+#import <Security/Security.h>
 #import <objc/runtime.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <stdio.h>
@@ -70,7 +49,7 @@ static int gBlockCount = 0;            // 嵌套验证计数
 static CFTimeInterval gBlockedSince = 0;
 static BOOL gLGPrefsToggled = NO;      // 本进程是否真正把 Global.Enabled YES→NO 切过
 
-#pragma mark - 文件追踪（不依赖 log 命令，v1.4 沿用；线程安全）
+#pragma mark - 文件追踪（不依赖 log 命令；线程安全）
 
 static FILE *gTraceFile = NULL;
 
@@ -165,7 +144,7 @@ static void lgPrefsRestoreLocked(void) {
     lgTraceLocked("prefs: Global.Enabled NO -> YES, Reload posted\n");
 }
 
-#pragma mark - 快速类名检测（BioProtect 辅助信号）
+#pragma mark - 快速类名检测（BioProtect 特征）
 
 static inline BOOL lgNameHas(const char *n, const char *sub) {
     return n && *n && sub && strstr(n, sub) != NULL;
@@ -188,6 +167,16 @@ static BOOL lgChainHasBio(UIViewController *vc) {
         if (lgIsBioVC(c)) return YES;
     }
     return NO;
+}
+
+// 组装 presenting 链的类名字符串（用于取证）
+static NSString *lgChainString(UIViewController *vc) {
+    NSMutableString *s = [NSMutableString string];
+    for (UIViewController *c = vc; c; c = c.presentingViewController) {
+        if (s.length) [s appendString:@" <- "];
+        [s appendString:@(class_getName(object_getClass(c)))];
+    }
+    return s;
 }
 
 #pragma mark - 一次性消毒（只在 LiquidAss 被禁用后执行，不会重新注入）
@@ -285,11 +274,12 @@ static void lgSetBlocked(BOOL blocked, const char *why) {
     pthread_mutex_unlock(&gLock);
 }
 
-#pragma mark - LAContext 接口声明（NSInteger 代替 LAPolicy，避免链接 LocalAuthentication 符号）
+#pragma mark - LAContext 接口声明（NSInteger/SecAccessControlRef 代替私有类型）
 
 @interface LAContext (LGCompat)
 - (void)evaluatePolicy:(NSInteger)policy localizedReason:(NSString *)localizedReason reply:(void (^)(BOOL success, NSError *error))reply;
 - (void)evaluatePolicy:(NSInteger)policy options:(NSDictionary *)options reply:(void (^)(BOOL success, NSError *error))reply;
+- (void)evaluateAccessControl:(SecAccessControlRef)control operation:(NSInteger)operation options:(NSDictionary *)options reply:(void (^)(BOOL success, NSError *error))reply;
 @end
 
 #pragma mark - 信号 hooks
@@ -326,6 +316,41 @@ static void lgSetBlocked(BOOL blocked, const char *why) {
         if (wrapped) wrapped(success, error);
     };
     %orig(policy, options, gate);
+}
+
+- (void)evaluateAccessControl:(SecAccessControlRef)control operation:(NSInteger)operation options:(NSDictionary *)options reply:(void (^)(BOOL success, NSError *error))reply {
+    lgTrace("[LA] evaluateAccessControl op:%ld\n", (long)operation);
+    lgSetBlocked(YES, "LAAccessControl");
+
+    void (^wrapped)(BOOL, NSError *) = [reply copy];
+    void (^gate)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
+        lgTrace("[LA] ac reply success=%d error=%s\n",
+                success, error ? error.localizedDescription.UTF8String : "(nil)");
+        lgSetBlocked(NO, "LAAccessControlReply");
+        if (wrapped) wrapped(success, error);
+    };
+    %orig(control, operation, options, gate);
+}
+
+%end
+
+// 取证 + 辅助信号：记录每个进程的每个 UIAlertController 弹窗，
+// 直接锁定 BioProtect 弹窗的进程/类名/标题/呈现链；含 Bio 特征即 BLOCK。
+%hook UIAlertController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    NSString *title = self.title ?: @"";
+    NSString *msg = self.message ?: @"";
+    NSString *chain = lgChainString(self);
+    lgTrace("[ALERT] class=%s title=%s msg=%s chain=%s\n",
+            class_getName(object_getClass(self)),
+            title.UTF8String, msg.UTF8String, chain.UTF8String);
+    if (lgIsBioVC(self) || lgChainHasBio(self)) {
+        lgTrace("signal UIAlertController viewDidAppear class=%s\n",
+                class_getName(object_getClass(self)));
+        lgSetBlocked(YES, "alertVDA");
+    }
 }
 
 %end
@@ -389,8 +414,8 @@ static void lgSetBlocked(BOOL blocked, const char *why) {
 #pragma mark - 初始化
 
 %ctor {
-    lgTrace("ctor: dass v1.5 loaded\n");
-    // 无条件初始化：LAContext/UIView/UIViewController/UIAlertView 在所有 UIKit
-    // 进程存在，类名检测在非 BioProtect 环境自然 no-op，零副作用。
+    lgTrace("ctor: dass v1.6 loaded\n");
+    // 无条件初始化：LAContext/UIView/UIViewController/UIAlertView/UIAlertController
+    // 在所有 UIKit 进程存在，类名检测在非 BioProtect 环境自然 no-op，零副作用。
     %init(LGBlockSignals);
 }

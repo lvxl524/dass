@@ -16,14 +16,17 @@ LiquidAss 0.1.0b（"next level diarrhea"大版本）新增多个全进程 hook �
 - Alerts 的 `LGAlertsEnabled()` = `LG_globalEnabled() && ...`，`LG_globalEnabled()` = `LG_prefBool(@"Global.Enabled", NO)`，同样受门控；
 - 偏好域 `dylv.liquidassprefs`（CFPreferences app-domain），LGSharedSupport 与 LGGlassKit 都监听 Darwin 通知 `dylv.liquidassprefs/Reload` 刷新缓存——**写一次偏好 + post 一次通知，全进程同时生效**。
 
-## 方案（v1.5）
+## 方案（v1.6）
 
-1. **系统级信号**：`%hook LAContext -evaluatePolicy:localizedReason:reply:` 与 `-evaluatePolicy:options:reply:`（人脸/指纹验证的通用系统入口，任何 App 触发验证都会命中，不再依赖猜 BioProtect 类名）：
-   - `evaluatePolicy` 进入 → **BLOCK**：`Global.Enabled` 置 NO（仅当原值为 YES 才写，避免污染用户设置）+ `CFPreferencesAppSynchronize` + post `Reload` 通知 → LiquidAss 全进程停摆；
-   - reply 回调执行（成功/失败/取消都会回调，天然覆盖整个验证窗口）→ **RELEASE**：恢复 `Global.Enabled=YES` + post `Reload` → LiquidAss 恢复正常。
-2. **一次性异步消毒**：BLOCK 生效后清理已注入的 `LGLive*`/`LiquidAss*` 玻璃视图、恢复被压制的背板——此时 LiquidAss 不会重新注入，消毒安全且干净。
-3. **辅助信号**（第二层保障）：BioProtect 类名检测（`UIView didMoveToWindow` / `UIViewController viewDidAppear/viewDidDisappear` / `UIAlertView show/dismiss`）。
-4. **嵌套验证计数**（count++/--，归零才恢复）+ **120s 超时强制释放**兜底。
+1. **系统级信号**（人脸/指纹验证的通用系统入口，任何 App 触发验证都会命中，不再依赖猜 BioProtect 类名）：
+   - `%hook LAContext -evaluatePolicy:localizedReason:reply:`
+   - `-evaluatePolicy:options:reply:`
+   - `-evaluateAccessControl:operation:options:reply:`（Secure Enclave 访问控制通道，v1.6 新增——BioProtect 若走该通道，v1.5 的两个变体会漏）
+   - 每个变体：进入 → **BLOCK**：`Global.Enabled` 置 NO（仅当原值为 YES 才写，避免污染用户设置）+ `CFPreferencesAppSynchronize` + post `Reload` 通知 → LiquidAss 全进程停摆；reply 回调执行（成功/失败/取消都会回调，天然覆盖整个验证窗口）→ **RELEASE**：恢复 `Global.Enabled=YES` + post `Reload` → LiquidAss 恢复正常。
+2. **弹窗取证**（v1.6 新增）：`%hook UIAlertController viewDidAppear:` 记录**每个进程的每个弹窗**——进程名、弹窗类名、title、message、presenting 链全部写入 trace，直接锁定 BioProtect 弹窗的真身（此前所有猜类名方案失败，因为不知道真实类名）；若弹窗类名/呈现链含 BioProtect 特征，同时触发 BLOCK。
+3. **一次性异步消毒**：BLOCK 生效后清理已注入的 `LGLive*`/`LiquidAss*` 玻璃视图、恢复被压制的背板——此时 LiquidAss 不会重新注入，消毒安全且干净。
+4. **辅助信号**（第二层保障）：BioProtect 类名检测（`UIView didMoveToWindow` / `UIViewController viewDidAppear/viewDidDisappear` / `UIAlertView show/dismiss`）。
+5. **嵌套验证计数**（count++/--，归零才恢复）+ **120s 超时强制释放**兜底。
 
 **v1.4 文件追踪**（本设备 `/usr/bin/log` 与 `/var/jb/usr/bin/log` 均不存在，系统日志通道不可用）：
 - 每次 信号 / 消毒 / 偏好切换 / 释放 / 超时 写一行到 `/var/mobile/dass_trace.log`（沙盒应用自动降级到 `NSHomeDirectory()/dass_trace.log`）；
@@ -34,7 +37,8 @@ LiquidAss 0.1.0b（"next level diarrhea"大版本）新增多个全进程 hook �
 - **v1.2 崩溃**：出现验证弹窗即 watchdog 超时崩溃（`WeChat-2026-08-12-184512.ips` `0x8BADF00D` + `wakeups_resource`）→ 200ms 持续消毒 timer + `setAlpha:`/`setHidden:` 拦截与 LiquidAss 拉锯活锁。
 - **v1.3 修复**：删除持续 timer 与全部属性拦截 hook（零对抗点），消毒改事件驱动一次性异步 → 不再产生 watchdog 崩溃报告，但仍进安全模式。
 - **v1.4 文件追踪**：替换不可用的 log 通道，定位到"信号从未命中、消毒空转"。
-- **v1.5 釜底抽薪**：LAContext 系统级信号 + `Global.Enabled` 偏好开关（源码确认门控全部组件）+ Reload 通知，从源头停掉 LiquidAss，而非视图对抗。
+- **v1.5 釜底抽薪**：LAContext 系统级信号 + `Global.Enabled` 偏好开关（源码确认门控全部组件）+ Reload 通知，从源头停掉 LiquidAss，而非视图对抗。**实机仍"验证弹窗一出即注销"**——v1.5 只覆盖两个 evaluatePolicy 变体，若 BioProtect 走 `evaluateAccessControl:` 或私有通道则信号落空。
+- **v1.6 全变体 + 取证**：LAContext 信号扩至三变体（含 `evaluateAccessControl:`）；新增 UIAlertController 全进程弹窗记录（进程/类名/title/message/呈现链），把 BioProtect 弹窗真身与崩溃进程钉死，同时扩展 BLOCK 触发面。
 
 非 BioProtect 环境（无任何验证触发）完全透传，零副作用。
 
@@ -42,7 +46,7 @@ LiquidAss 0.1.0b（"next level diarrhea"大版本）新增多个全进程 hook �
 
 ```sh
 # 需要已安装 BioProtectXS (org.mr.bioprotectxs-rootless)
-dpkg -i com.lvxl.dass_1.5.0_iphoneos-arm64.deb
+dpkg -i com.lvxl.dass_1.6.0_iphoneos-arm64.deb
 killall -9 SpringBoard
 ```
 

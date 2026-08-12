@@ -1,9 +1,9 @@
 Package: com.lvxl.dass
 Name: dass
 Depends: mobilesubstrate, firmware (>= 15.0), org.mr.bioprotectxs-rootless
-Version: 1.5.0
+Version: 1.6.0
 Architecture: iphoneos-arm64
-Description: BioProtectXS x LiquidAss 兼容适配层 v1.5（偏好釜底抽薪版）。源码证据确认：BioProtect 解锁弹窗出现在受保护 App 进程内（崩溃证据全在 WeChat），LiquidAss 0.1.0b 的全进程组件（TabBar/Keyboard/Spotlight/ContextMenu 等）在锁屏 UI 上持续做样式改造导致启动期 CPU 风暴（scene-create watchdog 0x8BADF00D）；釜底抽薪点是偏好域 dylv.liquidassprefs 的 Global.Enabled —— 所有组件动作都过 lgHostEnabled/LGAlertsEnabled 的全局门控。v1.5 用 LAContext evaluatePolicy 作为系统级人脸/指纹验证信号：验证开始写 Global.Enabled=NO 并 post dylv.liquidassprefs/Reload 通知（LiquidAss 全进程停摆），一次性异步消毒清理已注入玻璃层，reply 回调（成功/失败/取消都回调）后恢复原值。保留 BioProtect 类名辅助信号与 120s 超时兜底。v1.4 的文件追踪（/var/mobile/dass_trace.log）沿用。安装后无需任何设置。
+Description: BioProtectXS x LiquidAss 兼容适配层 v1.6（全变体信号+弹窗取证版）。v1.5 实机仍"验证弹窗一出即注销"：v1.5 只 hook LAContext 两个 evaluatePolicy 变体，若 BioProtect 走 evaluateAccessControl: 或私有生物识别通道则信号落空且无从定位。v1.6 扩展 LAContext 信号至三变体（含 evaluateAccessControl:operation:options:reply:，Secure Enclave 访问控制通道），并新增 UIAlertController viewDidAppear 全进程弹窗取证（记录进程/类名/title/message/presenting 链，直接锁定 BioProtect 弹窗真身；含 Bio 特征即 BLOCK）。核心机制不变：源码确认偏好域 dylv.liquidassprefs 的 Global.Enabled 门控 LiquidAss 全部组件（lgHostEnabled/LGAlertsEnabled 第一道门），BLOCK=写 NO+post dylv.liquidassprefs/Reload 通知全进程停摆+一次性异步消毒，RELEASE=恢复 YES。保留类名辅助信号与 120s 超时兜底。文件追踪 /var/mobile/dass_trace.log 沿用。安装后无需任何设置。
 Maintainer: lvxl
 Author: lvxl
 Section: Tweaks
