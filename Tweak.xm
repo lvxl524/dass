@@ -64,14 +64,14 @@ static BOOL bpWindowIsProtected(UIWindow *window) {
         return [entry[@"p"] boolValue];
 
     NSUInteger budget = 3000;
-    BOOL protected = bpSubtreeContainsBioProtect(window, &budget);
-    if (!protected) {
+    BOOL isProtected = bpSubtreeContainsBioProtect(window, &budget);
+    if (!isProtected) {
         for (UIViewController *vc = window.rootViewController; vc; vc = vc.presentedViewController) {
-            if (bpNameMatches(vc)) { protected = YES; break; }
+            if (bpNameMatches(vc)) { isProtected = YES; break; }
         }
     }
-    [cache setObject:@{ @"t": @(now), @"p": @(protected) } forKey:window];
-    return protected;
+    [cache setObject:@{ @"t": @(now), @"p": @(isProtected) } forKey:window];
+    return isProtected;
 }
 
 static BOOL bpIsBioProtectContext(UIView *view) {
