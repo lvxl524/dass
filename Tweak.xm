@@ -286,6 +286,8 @@ static void lgSetBlocked(BOOL blocked, const char *why) {
 
 #pragma mark - LAContext 接口声明（NSInteger 代替 LAPolicy，避免链接 LocalAuthentication）
 
+@class LAContext;
+
 @interface LAContext (LGCompat)
 - (void)evaluatePolicy:(NSInteger)policy localizedReason:(NSString *)localizedReason reply:(void (^)(BOOL success, NSError *error))reply;
 - (void)evaluatePolicy:(NSInteger)policy options:(NSDictionary *)options reply:(void (^)(BOOL success, NSError *error))reply;
